@@ -7,7 +7,7 @@ import {
   LocateFixed,
   Search, Radar, Globe, Shield, FileText, Radio,
   ChevronDown, ChevronUp, Loader2, AlertTriangle, Server,
-  Lock, MapPin, Bug, Code, Layers, Network, Fingerprint,
+  Lock, MapPin, Bug, Wifi, Code, Layers, Network, Fingerprint,
   CheckCircle, XCircle, Clock, ExternalLink, Crosshair,
   Maximize2, Minimize2, Gavel, Bitcoin, Phone, Terminal, ShieldAlert, User
 } from 'lucide-react';
@@ -44,7 +44,7 @@ interface ToolDef {
 }
 
 const TABS: ToolDef[] = [
-  { id: 'scanner', label: 'PORT SCAN', icon: Radar, placeholder: 'IP address to sweep (e.g. 8.8.8.8)', color: '#00E5FF', group: 'network', blurb: 'Shodan network sweep — same as GLOBAL SWEEP' },
+  { id: 'scanner', label: 'PORT SCAN', icon: Radar, placeholder: 'IP or hostname (e.g. 8.8.8.8)', color: '#00E5FF', group: 'network', blurb: 'Shodan open ports, services and banners — or a subnet sweep' },
   { id: 'vuln', label: 'VULN SWEEP', icon: Bug, placeholder: 'IP or hostname', color: '#FF3D3D', group: 'network', blurb: 'Known CVEs affecting the host' },
   { id: 'shodan', label: 'SHODAN IOT', icon: Network, placeholder: 'IP address', color: '#FF3D3D', group: 'network', blurb: 'Internet-exposed device record' },
   { id: 'bgp', label: 'BGP ROUTE', icon: Globe, placeholder: 'IP or ASN', color: '#00E5FF', group: 'network', blurb: 'Autonomous system and prefixes' },
@@ -117,6 +117,8 @@ function OsintPanelInner({ isMobile, onSweepVisualize, onScanGeolocate }: OsintP
   const [sweepResult, setSweepResult] = useState<any>(null);
   const [sweepProgress, setSweepProgress] = useState<{ current: number; total: number } | null>(null);
   const [sweepCidr, setSweepCidr] = useState(24);
+  /** PORT SCAN runs a Shodan host port scan, or — as an option — the GLOBAL SWEEP of the subnet. */
+  const [scanMode, setScanMode] = useState<'ports' | 'sweep'>('ports');
   const [cveCache, setCveCache] = useState<Record<string, any>>({});
   // CHAIN INTEL carries two views: the daily brief needs no target, the wallet
   // lookup uses the shared query bar.
@@ -216,11 +218,8 @@ function OsintPanelInner({ isMobile, onSweepVisualize, onScanGeolocate }: OsintP
     if (!query.trim() || loading) return;
     setLoading(true); setError(''); setResults(null);
 
-    // Shodan subnet sweep. The sweep tab and the first scanner (PORT SCAN) both
-    // run it: the stand-alone /api/scanner backend needs a key and is off here,
-    // so the first scanner does what GLOBAL SWEEP does — a keyless InternetDB
-    // sweep of the target's subnet.
-    if (activeTab === 'sweep' || activeTab === 'scanner') {
+    // Shodan subnet sweep — the GLOBAL SWEEP tab, and PORT SCAN in its sweep mode.
+    if (activeTab === 'sweep' || (activeTab === 'scanner' && scanMode === 'sweep')) {
       setSweepResult(null);
       const cidr = sweepCidr;
       const totalHosts = Math.pow(2, 32 - cidr);
@@ -292,6 +291,7 @@ function OsintPanelInner({ isMobile, onSweepVisualize, onScanGeolocate }: OsintP
     try {
       let url = '';
       switch (activeTab) {
+        case 'scanner': url = `/api/osint/portscan?target=${encodeURIComponent(query)}`; break;
 
         case 'dns': url = `/api/osint/dns?domain=${encodeURIComponent(query)}`; break;
         case 'certs': url = `/api/osint/certs?domain=${encodeURIComponent(query)}`; break;
@@ -356,7 +356,8 @@ function OsintPanelInner({ isMobile, onSweepVisualize, onScanGeolocate }: OsintP
              onScanGeolocate(query, { lat: data.lat, lng: data.lng, type: 'phone', region: data.region });
           }
         } else if (activeTab !== 'sweep' && activeTab !== 'vuln' && activeTab !== 'crypto' && activeTab !== 'username' && activeTab !== 'mac' && activeTab !== 'bgp' && activeTab !== 'github' && activeTab !== 'leaks' && activeTab !== 'phone') {
-          fetch(`/api/osint/ip?ip=${encodeURIComponent(query)}`)
+          // PORT SCAN resolves a hostname to its address; geolocate that.
+          fetch(`/api/osint/ip?ip=${encodeURIComponent(activeTab === 'scanner' && data.ip ? data.ip : query)}`)
             .then(r => r.json())
             .then(locData => {
               if (locData && locData.geo && locData.geo.lat && locData.geo.lon && onScanGeolocate) {
@@ -371,7 +372,7 @@ function OsintPanelInner({ isMobile, onSweepVisualize, onScanGeolocate }: OsintP
       }
     } catch { setError('Network error'); }
     finally { setLoading(false); }
-  }, [query, activeTab, loading, sweepCidr]);
+  }, [query, activeTab, loading, sweepCidr, scanMode]);
 
   // Save the current result (a sweep or a single lookup) as a file the reader keeps.
   const exportResults = useCallback((format: 'json' | 'txt') => {
@@ -457,6 +458,68 @@ function OsintPanelInner({ isMobile, onSweepVisualize, onScanGeolocate }: OsintP
     }
     if (!results) return null;
     const r = results;
+
+    // ── PORT SCAN (Shodan host) ──
+    if (activeTab === 'scanner') {
+      const ports: any[] = Array.isArray(r.ports) ? r.ports : [];
+      const loc = [r.location?.city, r.location?.country].filter(Boolean).join(', ');
+      return (
+        <div>
+          <SectionHeader title="HOST INFO" icon={Server} color="#00E5FF" />
+          <div className="mb-1.5">
+            <span className={`inline-flex items-center px-2 py-0.5 rounded text-[9px] font-mono font-bold tracking-wider border ${r.source === 'shodan' ? 'bg-[#00E5FF]/10 text-[#00E5FF] border-[#00E5FF]/30' : 'bg-[#FF9500]/10 text-[#FF9500] border-[#FF9500]/30'}`}>
+              {r.source === 'shodan' ? 'SHODAN HOST API' : 'SHODAN INTERNETDB · KEYLESS'}
+            </span>
+          </div>
+          {r.note && <div className="mb-1.5 text-[10px] font-mono text-[var(--text-muted)]">{r.note}</div>}
+          <ResultRow label="Target" value={r.target || query} color="#00E5FF" />
+          {r.ip !== r.target && <ResultRow label="IP" value={r.ip} />}
+          <ResultRow label="Org" value={r.org} />
+          <ResultRow label="ISP" value={r.isp} />
+          <ResultRow label="ASN" value={r.asn} />
+          <ResultRow label="OS" value={r.os} />
+          <ResultRow label="Location" value={loc} />
+          {r.hostnames?.length > 0 && <ResultRow label="Hostnames" value={r.hostnames.join(', ')} />}
+          {r.tags?.length > 0 && <ResultRow label="Tags" value={r.tags.join(', ')} color="#FF9500" />}
+          <ResultRow label="Last Seen" value={r.last_update} />
+
+          <SectionHeader title={`OPEN PORTS (${ports.length})`} icon={Wifi} color="#00E676" />
+          {ports.length === 0 && <div className="text-[10px] font-mono text-[var(--text-muted)] py-1">No open ports on record.</div>}
+          <div className="space-y-1">
+            {ports.map((p: any) => (
+              <div key={`${p.port}/${p.transport}`} className="px-2 py-1.5 rounded border border-[var(--border-secondary)]/30 hover:bg-[var(--hover-accent)] transition-colors">
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] font-mono font-bold text-[var(--cyan-primary)] w-[70px] flex-shrink-0">{p.port}/{p.transport}</span>
+                  <span className="text-[11px] font-mono text-[var(--text-secondary)] flex-1 truncate">{p.service || 'unknown'}</span>
+                  {(p.product || p.version) && <span className="text-[10px] font-mono text-[var(--text-muted)] truncate max-w-[45%]">{[p.product, p.version].filter(Boolean).join(' ')}</span>}
+                  {p.vulns?.length > 0 && <span className="text-[9px] font-mono font-bold px-1.5 py-0.5 rounded bg-red-500/20 text-red-400">{p.vulns.length} CVE</span>}
+                </div>
+                {p.title && <div className="text-[10px] font-mono text-[var(--text-muted)] mt-0.5 truncate">{p.title}</div>}
+                {p.banner && (
+                  <details className="mt-0.5">
+                    <summary className="text-[9px] font-mono tracking-wider text-[var(--text-muted)] cursor-pointer hover:text-[var(--cyan-primary)]">BANNER</summary>
+                    <pre className="mt-1 p-1.5 rounded bg-[#0D0D0C] text-[9px] font-mono text-[var(--text-secondary)] whitespace-pre-wrap break-all max-h-40 overflow-y-auto styled-scrollbar">{p.banner}</pre>
+                  </details>
+                )}
+              </div>
+            ))}
+          </div>
+
+          {r.cpes?.length > 0 && <ResultRow label="CPEs" value={r.cpes.join(', ')} />}
+          {r.vulns?.length > 0 && (
+            <div className="mt-2 p-2 border border-red-500/30 bg-red-500/10 rounded">
+              <span className="text-[11px] font-mono text-red-400 font-bold mb-1 block">VULNERABILITIES ({r.vulns.length})</span>
+              <div className="flex flex-wrap gap-1">
+                {r.vulns.slice(0, 20).map((v: string) => (
+                  <a key={v} href={`https://nvd.nist.gov/vuln/detail/${v}`} target="_blank" rel="noreferrer" className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-[#1A1A18] text-[#8A8880] hover:text-[#FF3D3D]">{v}</a>
+                ))}
+                {r.vulns.length > 20 && <span className="text-[10px] font-mono text-[#8A8880]">+{r.vulns.length - 20} more</span>}
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
 
     // ── VULN SCAN ──
     if (activeTab === 'vuln') {
@@ -1285,7 +1348,7 @@ function OsintPanelInner({ isMobile, onSweepVisualize, onScanGeolocate }: OsintP
           <div className="flex-1 relative">
             <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-[var(--text-muted)]" />
             <input type="text" value={query} onChange={e => setQuery(e.target.value)} onKeyDown={e => e.key === 'Enter' && runLookup()}
-              placeholder={currentTab?.placeholder}
+              placeholder={activeTab === 'scanner' && scanMode === 'sweep' ? 'IP address to sweep (e.g. 8.8.8.8)' : currentTab?.placeholder}
               className="w-full bg-[var(--bg-primary)]/60 border border-[var(--border-primary)] rounded-lg pl-8 pr-3 py-2.5 text-[10px] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)]/40 focus:outline-none transition-colors"
               style={{ borderColor: query ? `${currentTab?.color}40` : undefined }} />
           </div>
@@ -1297,9 +1360,26 @@ function OsintPanelInner({ isMobile, onSweepVisualize, onScanGeolocate }: OsintP
         </div>
         )}
 
-        {/* Secondary Controls — the first scanner sweeps like GLOBAL SWEEP, so
-            both carry the subnet-mask control. */}
-        {(activeTab === 'sweep' || activeTab === 'scanner') && (
+        {/* PORT SCAN mode — a Shodan host port scan, or the GLOBAL SWEEP of its subnet. */}
+        {activeTab === 'scanner' && (
+          <div className="flex gap-1">
+            {([['ports', 'SHODAN PORT SCAN'], ['sweep', 'GLOBAL SWEEP']] as const).map(([id, label]) => (
+              <button
+                key={id}
+                onClick={() => { if (scanMode !== id) { setScanMode(id); setResults(null); setSweepResult(null); setError(''); } }}
+                className="px-2 py-1 rounded text-[10px] font-mono font-bold tracking-wider transition-colors"
+                style={{
+                  color: scanMode === id ? currentTab?.color : 'var(--text-muted)',
+                  background: scanMode === id ? `${currentTab?.color}1a` : 'transparent',
+                  border: `1px solid ${scanMode === id ? `${currentTab?.color}55` : 'rgba(255,255,255,0.1)'}`,
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        )}
+        {(activeTab === 'sweep' || (activeTab === 'scanner' && scanMode === 'sweep')) && (
           <div className="flex items-center justify-between bg-[var(--bg-primary)]/60 border border-[var(--border-primary)] rounded-lg p-1">
             <span className="text-[10px] font-mono text-[var(--text-muted)] pl-2">SUBNET MASK:</span>
             <div className="flex items-center gap-0.5">
@@ -1351,7 +1431,7 @@ function OsintPanelInner({ isMobile, onSweepVisualize, onScanGeolocate }: OsintP
       )}
 
       {/* Sweep Results */}
-      {sweepResult && !loading && (activeTab === 'sweep' || activeTab === 'scanner') && (
+      {sweepResult && !loading && (activeTab === 'sweep' || (activeTab === 'scanner' && scanMode === 'sweep')) && (
         <div className="bg-[var(--bg-primary)]/40 border border-[var(--border-primary)] rounded-lg overflow-hidden max-h-[55vh] overflow-y-auto styled-scrollbar">
           {/* Summary */}
           <div className="p-3 border-b border-[#2A2A28]">

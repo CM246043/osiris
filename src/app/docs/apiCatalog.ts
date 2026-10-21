@@ -430,6 +430,13 @@ export const API_GROUPS: ApiGroup[] = [
         returns: ['status', 'ports', 'hostnames', 'cpes', 'vulns', 'tags', 'detail'],
       },
       {
+        path: '/api/osint/portscan',
+        method: 'GET',
+        summary: 'Shodan port scan of one host: open ports with service, product, version, banner and CVEs. Uses the Shodan host API when SHODAN_API_KEY is set, otherwise the keyless InternetDB record.',
+        params: [{ name: 'target', required: true, desc: 'IP address or hostname to scan.', example: '8.8.8.8' }],
+        returns: ['target', 'ip', 'source', 'ports', 'hostnames', 'domains', 'org', 'isp', 'asn', 'os', 'location', 'cpes', 'vulns', 'tags', 'last_update', 'note'],
+      },
+      {
         path: '/api/osint/bgp',
         method: 'GET',
         summary: 'ASN, prefix, and peering relationships.',
