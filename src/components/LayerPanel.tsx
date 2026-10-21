@@ -60,6 +60,7 @@ const LAYER_GROUPS: LayerGroupDef[] = [
       { key: 'live_clouds', label: 'Live Clouds', description: 'NOAA satellites · lit in 3D · hourly', dataKey: '' },
       { key: 'wind', label: 'Wind', description: 'NOAA GFS · surface wind · 6-hourly', dataKey: '' },
       { key: 'wind_controls', label: 'Time Controls', description: '3 days back · 5 ahead', dataKey: '', parent: 'wind' },
+      { key: 'wind_particles', label: 'Particles', description: 'The classic look · coloured by speed', dataKey: '', parent: 'wind' },
       { key: 'rain', label: 'Rain', description: 'RainViewer radar · every 10 min', dataKey: '' },
       { key: 'rain_controls', label: 'Time Controls', description: 'Last 2 hours · loop', dataKey: '', parent: 'rain' },
     ],

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   createPlayback, courseBetween, displayTimeFor, forgetFeedsOtherThan, ingest, metresBetween, motionOf, sampleAt,
-  trailOf, turnBetween, updateCourse, MISSED_POLLS_TO_DROP, NO_FIX_AFTER_MS,
+  trailOf, tripStats, turnBetween, updateCourse, MISSED_POLLS_TO_DROP, NO_FIX_AFTER_MS,
 } from './transit-playback';
 import type { TransitVehicle } from './transit';
 
@@ -145,5 +145,69 @@ describe('heading and motion', () => {
     expect(motionOf(track, sampleAt(track, T0 + 45_000), T0 + 45_000, T0 + 45_000)).toBe('stopped');
     const later = T0 + 40_000 + NO_FIX_AFTER_MS + 1;
     expect(motionOf(track, sampleAt(track, later), later, later)).toBe('no recent fix');
+  });
+});
+
+describe('tripStats', () => {
+  // Due north in 0.001° hops (~111 m), 20 s apart: about 5.6 m/s.
+  const drive = (fixes: [number, number][]) => {
+    const pb = createPlayback();
+    for (const [s, lat] of fixes) ingest(pb, [bus({ lat, lng: -71, t: T0 / 1000 + s, trip: 'a' })], T0 + s * 1000);
+    return pb.tracks.get('mbta:y1')!;
+  };
+
+  it('measures the speed it is drawn at, the distance so far, and the time tracked', () => {
+    const track = drive([[0, 42], [20, 42.001], [40, 42.002], [60, 42.003], [80, 42.004]]);
+    const at = T0 + 70_000; // halfway along the fourth hop
+    const stats = tripStats(track, sampleAt(track, at), at);
+    expect(stats.speed).toBeCloseTo(111.3 / 20, 1);
+    expect(stats.distance).toBeCloseTo(111.3 * 3.5, -1);
+    expect(stats.tracked).toBe(70_000);
+    expect(stats.avgSpeed).toBeCloseTo(111.3 / 20, 1);
+    expect(stats.topSpeed).toBeCloseTo(111.3 / 20, 1);
+  });
+
+  it('reads zero when it reported twice in one place, and holds no average over a few seconds', () => {
+    const track = drive([[0, 42], [20, 42.001], [40, 42.001]]);
+    const at = T0 + 50_000;
+    const stats = tripStats(track, sampleAt(track, at), at);
+    expect(stats.speed).toBe(0);
+    expect(stats.tracked).toBe(40_000);
+    expect(stats.avgSpeed).toBeUndefined(); // under a minute tracked
+  });
+
+  it('counts only this trip: a new trip starts the numbers again', () => {
+    const pb = createPlayback();
+    ingest(pb, [bus({ lat: 42, lng: -71, t: T0 / 1000, trip: 'a' })], T0);
+    ingest(pb, [bus({ lat: 42.001, lng: -71, t: T0 / 1000 + 20, trip: 'a' })], T0 + 20_000);
+    ingest(pb, [bus({ lat: 42.0011, lng: -71, t: T0 / 1000 + 40, trip: 'b' })], T0 + 40_000);
+    ingest(pb, [bus({ lat: 42.0021, lng: -71, t: T0 / 1000 + 60, trip: 'b' })], T0 + 60_000);
+    const track = pb.tracks.get('mbta:y1')!;
+    const at = T0 + 60_000;
+    const stats = tripStats(track, sampleAt(track, at), at);
+    expect(stats.distance).toBeCloseTo(111.3, 0);
+    expect(stats.tracked).toBe(20_000);
+  });
+
+  it('never shows a top speed below the speed it is doing now', () => {
+    // Waits at a stop, then pulls away: the hop it is on is the fastest yet.
+    const track = drive([[0, 42], [20, 42], [40, 42.002]]);
+    const at = T0 + 30_000;
+    const stats = tripStats(track, sampleAt(track, at), at);
+    expect(stats.speed).toBeCloseTo(222.6 / 20, 1);
+    expect(stats.topSpeed).toBe(stats.speed);
+  });
+
+  it('held at its last fix, waiting for the next, gives the speed of the hop that brought it there', () => {
+    const track = drive([[0, 42], [20, 42.001], [40, 42.003]]);
+    const at = T0 + 55_000; // past the last fix: drawn there, waiting
+    expect(sampleAt(track, at).moving).toBe(false);
+    expect(tripStats(track, sampleAt(track, at), at).speed).toBeCloseTo(222.6 / 20, 1);
+  });
+
+  it('does not call a hop of a second or two a speed', () => {
+    const track = drive([[0, 42], [2, 42.0005]]);
+    const at = T0 + 1_000;
+    expect(tripStats(track, sampleAt(track, at), at).speed).toBeUndefined();
   });
 });

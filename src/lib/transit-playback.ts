@@ -249,6 +249,61 @@ export function motionOf(track: Track, sample: Sample, nowMs: number, displayT: 
   return 'waiting';
 }
 
+/** A hop shorter than this (s) says too little about speed: GPS jitter over a few seconds reads as a sprint. */
+const MIN_SPEED_HOP_S = 5;
+
+export interface TripStats {
+  /** Speed where it is drawn, m/s: of the hop it is gliding along, or, held at a fix, of the hop that brought it there. */
+  speed?: number;
+  /** Fastest hop between two fixes this trip, m/s. */
+  topSpeed?: number;
+  /** Average over the stretch tracked, m/s, once there is enough of it to mean something. */
+  avgSpeed?: number;
+  /** Metres travelled this trip in the stretch tracked, up to where it is drawn. */
+  distance: number;
+  /** How long that stretch covers, ms. */
+  tracked: number;
+}
+
+/**
+ * The vehicle's numbers this trip, worked out from its own fixes, up to where it
+ * is drawn now. Only the fixes held count (the last HISTORY_MAX, back to the
+ * last cut), so these cover the stretch tracked, not the whole trip.
+ */
+export function tripStats(track: Track, sample: Sample, displayT: number): TripStats {
+  const f = track.fixes;
+  let start = 0;
+  for (let i = sample.index; i > 0; i--) if (f[i].cut) { start = i; break; }
+  let distance = 0;
+  let topSpeed: number | undefined;
+  for (let i = start; i < sample.index; i++) {
+    const metres = metresBetween(f[i], f[i + 1]);
+    distance += metres;
+    const seconds = (f[i + 1].t - f[i].t) / 1000;
+    if (seconds >= MIN_SPEED_HOP_S) topSpeed = Math.max(topSpeed ?? 0, metres / seconds);
+  }
+  distance += metresBetween(f[sample.index], sample);
+  const tracked = Math.max(0, Math.min(displayT, f[f.length - 1].t) - f[start].t);
+
+  // Gliding: the hop it is on. Held at a fix: the hop that brought it there, which is
+  // zero when it reported twice in one place. A hop across a cut is no speed at all.
+  const hopSpeed = (from: Fix, to: Fix | undefined): number | undefined => {
+    if (!to || to.cut) return undefined;
+    const seconds = (to.t - from.t) / 1000;
+    if (metresBetween(from, to) <= SAME_PLACE_M) return 0;
+    return seconds >= MIN_SPEED_HOP_S ? metresBetween(from, to) / seconds : undefined;
+  };
+  const a = f[sample.index];
+  const speed = sample.moving
+    ? hopSpeed(a, f[sample.index + 1])
+    : sample.index > 0 ? hopSpeed(f[sample.index - 1], a) : undefined;
+  // The hop it is on counts towards the top speed too.
+  if (speed !== undefined) topSpeed = Math.max(topSpeed ?? 0, speed);
+  // Under a minute, or under a hundred metres, an average is mostly noise.
+  const avgSpeed = tracked >= 60_000 && distance >= 100 ? distance / (tracked / 1000) : undefined;
+  return { speed, topSpeed, avgSpeed, distance, tracked };
+}
+
 /** The line it has travelled in this trip, up to where it is drawn now. */
 export function trailOf(track: Track, sample: Sample): [number, number][] {
   const f = track.fixes;

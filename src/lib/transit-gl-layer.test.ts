@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { TRANSIT_STRIDE, markerSize, packVehicle, rgb } from './transit-gl-layer';
-import { cardAnchor, framesPerSecond } from './transit-layer';
+import { cardAnchor, compassPoint, distanceParts, durationParts, framesPerSecond } from './transit-layer';
 
 describe('transit GPU layer packing', () => {
   it('writes mercator position, colour, heading and selection for one vehicle', () => {
@@ -41,5 +41,24 @@ describe('transit GPU layer packing', () => {
     expect(cardAnchor(180)).toBe('bottom'); // came from below: card above
     expect(cardAnchor(90)).toBe('right');   // came from the right: card to the left
     expect(cardAnchor(-90)).toBe('left');   // came from the left: card to the right
+  });
+});
+
+describe('vehicle card numbers', () => {
+  it('names the compass point a heading falls in', () => {
+    expect(compassPoint(0)).toBe('N');
+    expect(compassPoint(44)).toBe('NE');
+    expect(compassPoint(181)).toBe('S');
+    expect(compassPoint(338)).toBe('N');
+    expect(compassPoint(-90)).toBe('W');
+  });
+
+  it('writes distances and durations with their units', () => {
+    expect(distanceParts(640.4)).toEqual(['640', 'm']);
+    expect(distanceParts(2380)).toEqual(['2.4', 'km']);
+    expect(distanceParts(12_600)).toEqual(['13', 'km']);
+    expect(durationParts(45_000)).toEqual(['45', 's']);
+    expect(durationParts(12 * 60_000)).toEqual(['12', 'min']);
+    expect(durationParts(90 * 60_000)).toEqual(['1.5', 'h']);
   });
 });

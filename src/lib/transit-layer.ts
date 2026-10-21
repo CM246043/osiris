@@ -23,7 +23,7 @@ import {
 } from './transit';
 import {
   courseBetween, createPlayback, displayTimeFor, forgetFeedsOtherThan, ingest, metresBetween, motionOf, sampleAt, trailOf,
-  updateCourse, type Sample, type Track,
+  tripStats, updateCourse, type Sample, type Track,
 } from './transit-playback';
 import { TRANSIT_STRIDE, createTransitVehicleLayer, markerSize, packVehicle, rgb } from './transit-gl-layer';
 
@@ -61,7 +61,7 @@ const SETTLE_MS = 350;
 /** A click this close (px) to a vehicle selects it. */
 const PICK_RADIUS_PX = 14;
 /** Room (px) a vehicle card needs beside the vehicle: its size plus the popup's offset. */
-const CARD_W = 440, CARD_H = 370;
+const CARD_W = 440, CARD_H = 430;
 const EMPTY = { type: 'FeatureCollection' as const, features: [] };
 
 const esc = (s: unknown) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
@@ -69,6 +69,24 @@ const safeUrl = (s: unknown) => (/^https?:\/\//i.test(String(s ?? '')) ? esc(s) 
 const count = (n: number) => n.toLocaleString('en-US');
 const MODE_RGB = Object.fromEntries(TRANSIT_MODES.map(m => [m, rgb(TRANSIT_MODE_COLORS[m])])) as Record<TransitMode, [number, number, number]>;
 const modeColor = ['match', ['get', 'mode'], ...TRANSIT_MODES.flatMap(m => [m, TRANSIT_MODE_COLORS[m]]), TRANSIT_MODE_COLORS.unknown] as unknown as string;
+
+const COMPASS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+/** "NE": the eighth of the compass a heading falls in. */
+export function compassPoint(deg: number): string {
+  return COMPASS[Math.round((((deg % 360) + 360) % 360) / 45) % 8];
+}
+const kmh = (ms: number) => String(Math.round(ms * 3.6));
+/** "640 m", "2.4 km": a distance and its unit, for a KPI tile. */
+export function distanceParts(m: number): [string, string] {
+  return m < 1000 ? [String(Math.round(m)), 'm'] : [(m / 1000).toFixed(m < 10_000 ? 1 : 0), 'km'];
+}
+/** "45 s", "12 min", "1.5 h": a duration and its unit, for a KPI tile. */
+export function durationParts(ms: number): [string, string] {
+  const s = Math.round(ms / 1000);
+  if (s < 60) return [String(s), 's'];
+  if (s < 3600) return [String(Math.round(s / 60)), 'min'];
+  return [(s / 3600).toFixed(1), 'h'];
+}
 
 /** What the vehicle is called on its label: the route riders know, else the fleet number. */
 function labelOf(v: TransitVehicle): string {
@@ -157,23 +175,42 @@ export function attachTransit(map: MlMap, opts: TransitLayerOptions): () => void
     const routeText = v.name && v.route && v.name !== v.route ? `${esc(v.name)} <span style="color:#5C5A54;">(${esc(v.route)})</span>` : esc(v.name ?? v.route ?? '');
     const cell = (label: string, value: string | undefined, raw = false) => value
       ? `<div><span style="color:#5C5A54;">${label}</span><br/><span style="color:#E8E6E0;font-family:monospace;">${raw ? value : esc(value)}</span></div>` : '';
+    // The numbers: worked out from its own fixes where the feed sends none (most do not send speed).
+    const stats = tripStats(track, s, dT);
+    const speedNow = stats.speed ?? v.s;
+    const heading = track.course ?? v.b;
+    const kpi = (label: string, value: string | undefined, unit = '') => `<div style="border:1px solid ${color}26;border-radius:4px;padding:6px 7px;background:rgba(0,0,0,0.3);min-width:0;">
+        <div style="color:#5C5A54;font-size:8px;letter-spacing:0.12em;white-space:nowrap;">${label}</div>
+        <div style="color:${value ? '#E8E6E0' : '#5C5A54'};font-size:15px;font-weight:700;line-height:1.25;white-space:nowrap;">${value ?? '—'}${value && unit ? `<span style="color:#8A8880;font-size:9px;font-weight:400;"> ${unit}</span>` : ''}</div>
+      </div>`;
+    const [dist, distUnit] = distanceParts(stats.distance);
+    const [time, timeUnit] = durationParts(stats.tracked);
+    const known = stats.tracked > 0; // one fix has covered no ground yet
+    const kpis = [
+      kpi('SPEED', speedNow !== undefined ? kmh(speedNow) : undefined, 'km/h'),
+      kpi('AVG SPEED', stats.avgSpeed !== undefined ? kmh(stats.avgSpeed) : undefined, 'km/h'),
+      kpi('DISTANCE', known ? dist : undefined, distUnit),
+      kpi('TRACKED', known ? time : undefined, timeUnit),
+    ].join('');
     const cells = [
       cell('ROUTE', routeText, true),
       cell('VEHICLE', v.label ?? v.id),
       cell('STATE', motion.toUpperCase()),
-      cell('SPEED', v.s !== undefined ? `${Math.round(v.s * 3.6)} km/h` : undefined),
-      cell('HEADING', track.course !== undefined ? `${Math.round(track.course)}°` : undefined),
+      cell('HEADING', heading !== undefined ? `${compassPoint(heading)} · ${Math.round(heading)}°` : undefined),
+      cell('TOP SPEED', stats.topSpeed !== undefined ? `${kmh(stats.topSpeed)} km/h` : undefined),
       cell('SEATS', occupancyLabel(v.occ)),
       cell('LAST FIX', positionAge(v.t, nowMs)),
-      cell('FIXES HELD', `${track.fixes.length}`),
+      cell('REPORTS', track.interval !== undefined ? `every ${Math.round(track.interval / 1000)} s` : undefined),
+      cell('TRIP', v.trip),
     ].join('');
     const word = TRANSIT_MODE_WORDS[mode].toUpperCase();
-    return `<div style="background:rgba(12,14,26,0.95);backdrop-filter:blur(16px);border-radius:10px;padding:16px;font-family:'JetBrains Mono',monospace;border:1px solid ${color}55;min-width:230px;">
+    return `<div style="background:rgba(12,14,26,0.95);backdrop-filter:blur(16px);border-radius:10px;padding:16px;font-family:'JetBrains Mono',monospace;border:1px solid ${color}55;min-width:300px;">
       <div style="color:${color};font-size:12px;font-weight:700;letter-spacing:0.1em;border-bottom:1px solid ${color}33;padding-bottom:6px;margin-bottom:8px;">${word}${labelOf(v) ? ` ${esc(labelOf(v))}` : ''}</div>
       <div style="color:#E8E6E0;font-size:11px;font-weight:bold;margin-bottom:2px;">${esc(feed?.provider ?? 'Transit operator')}</div>
       ${where ? `<div style="color:#8A8880;font-size:9.5px;margin-bottom:8px;">${esc(where)}</div>` : ''}
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:9px;margin-bottom:8px;background:rgba(0,0,0,0.3);padding:6px;border-radius:4px;">${cells}</div>
-      <div style="font-size:8.5px;color:#5C5A54;line-height:1.45;">From the operator's own GPS feed. Shown ${lagS} s behind live so it can move between the places it reported; it is never guessed ahead. The line is where it has been this trip.</div>
+      <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin-bottom:8px;">${kpis}</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:9px;margin-bottom:8px;background:rgba(0,0,0,0.3);padding:6px;border-radius:4px;overflow-wrap:anywhere;">${cells}</div>
+      <div style="font-size:8.5px;color:#5C5A54;line-height:1.45;">From the operator's own GPS feed. Speeds and distance are measured between the places it reported, over the stretch of this trip tracked so far. Shown ${lagS} s behind live so it can move between those places; it is never guessed ahead. The line is where it has been this trip.</div>
       ${feed?.license ? `<a href="${safeUrl(feed.license)}" target="_blank" rel="noopener noreferrer" style="display:inline-block;margin-top:8px;padding:5px 12px;font-size:10px;letter-spacing:0.12em;text-decoration:none;border-radius:5px;color:${color};border:1px solid ${color}40;background:${color}15;">[ FEED TERMS ↗ ]</a>` : ''}
     </div>`;
   };

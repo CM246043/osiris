@@ -510,6 +510,8 @@ export default function Dashboard() {
        turning the layer on brings its controls; off, the layer shows now. */
     wind_controls: true,
     rain_controls: true,
+    /* Wind as particles coloured by speed, the classic look, instead of streamlines. */
+    wind_particles: false,
     terrain_3d: false,
     terrain_elevation: false,
     malware: false,
@@ -774,7 +776,7 @@ export default function Dashboard() {
       setOiFocus(false);
       return;
     }
-    const KEEP = new Set(['day_night', 'live_clouds', 'wind', 'wind_controls', 'rain', 'rain_controls', 'terrain_3d', 'terrain_elevation']);
+    const KEEP = new Set(['day_night', 'live_clouds', 'wind', 'wind_controls', 'wind_particles', 'rain', 'rain_controls', 'terrain_3d', 'terrain_elevation']);
     setActiveLayers(prev => {
       focusSaved.current = prev;
       return Object.fromEntries(Object.entries(prev).map(([k, v]) => [k, KEEP.has(k) ? v : false])) as typeof prev;
@@ -1812,12 +1814,12 @@ export default function Dashboard() {
       {/* ── RIGHT TOOL STRIP (desktop only — mobile uses bottom nav) ── */}
       {!isMobile && <motion.div data-hud initial={{ opacity: 0, x: 12 }} animate={revealed ? { opacity: 1, x: 0 } : { opacity: 0, x: 12 }} transition={hudIn(0.3)} className="absolute right-2 top-1/2 -translate-y-1/2 flex flex-col items-center gap-2 z-[250] pointer-events-auto bg-black/40 backdrop-blur-sm p-1 rounded-full border border-white/5">
         <div className="relative group">
-          <button onClick={() => { setShowIntel(!showIntel); setShowOi(false); setShowMarkets(false); setShowAlerts(false); }} className={`relative w-8 h-8 rounded-full flex items-center justify-center transition-all focus:outline-none focus-visible:ring-1 focus-visible:ring-white/50 ring-1 ring-[var(--cyan-primary)]/50 shadow-[0_0_16px_rgba(0,229,255,0.35)] ${showIntel ? 'bg-[var(--cyan-primary)]/25' : 'bg-[var(--cyan-primary)]/10 hover:bg-[var(--cyan-primary)]/20'}`} title="OSINT Recon — IP lookup, network sweep, geolocation" aria-label="OSINT Recon" aria-expanded={showIntel}>
-            <Radar className={`w-4 h-4 ${showIntel ? 'text-[var(--cyan-primary)]' : 'text-[var(--cyan-primary)]/90'}`} />
+          <button onClick={() => { setShowIntel(!showIntel); setShowOi(false); setShowMarkets(false); setShowAlerts(false); }} className={`relative w-8 h-8 rounded-full flex items-center justify-center transition-all focus:outline-none focus-visible:ring-1 focus-visible:ring-white/50 border duration-200 ${showIntel ? 'bg-[var(--gold-primary)]/20 border-[var(--gold-primary)]/70 shadow-[0_0_18px_rgba(var(--gold-rgb),0.35)]' : 'bg-[var(--gold-primary)]/[0.07] border-[var(--gold-primary)]/35 hover:bg-[var(--gold-primary)]/15 hover:border-[var(--gold-primary)]/60 hover:shadow-[0_0_14px_rgba(var(--gold-rgb),0.25)]'}`} title="OSINT Recon — IP lookup, network sweep, geolocation" aria-label="OSINT Recon" aria-expanded={showIntel}>
+            <Radar className={`w-4 h-4 ${showIntel ? 'text-[var(--gold-light)]' : 'text-[var(--gold-primary)]'}`} />
             {showIntel && (
               <span
                 aria-hidden="true"
-                className="absolute -right-1 top-1/2 -translate-y-1/2 h-4 w-[2px] rounded-full bg-current text-[var(--cyan-primary)]"
+                className="absolute -right-1 top-1/2 -translate-y-1/2 h-4 w-[2px] rounded-full bg-current text-[var(--gold-primary)]"
               />
             )}
           </button>
