@@ -1,5 +1,5 @@
 import type { WindGrid } from './wind-layer';
-import { bakeWindStreamlines } from './wind-streamlines';
+import { createWindBaker, type WindBakeRequest } from './wind-streamlines';
 
 /**
  * OSIRIS — the Wind layer's streamlines, made off the main thread. A full set
@@ -7,7 +7,7 @@ import { bakeWindStreamlines } from './wind-streamlines';
  * they are remade several times a second; here that never holds up the map.
  */
 
-type Request = { id: number; field: WindGrid; count: number };
+type Request = WindBakeRequest & { id: number; field: WindGrid };
 
 // The DOM typings describe a window; this file runs in a worker.
 const scope = self as unknown as {
@@ -15,7 +15,9 @@ const scope = self as unknown as {
   postMessage(message: unknown, transfer?: Transferable[]): void;
 };
 
-scope.onmessage = ({ data }) => {
-  const { vertices, count, paths } = bakeWindStreamlines(data.field, { count: data.count });
-  scope.postMessage({ id: data.id, vertices, count, paths }, [vertices.buffer]);
+const bake = createWindBaker();
+
+scope.onmessage = ({ data: { id, field, ...request } }) => {
+  const { vertices, count, paths, seeds } = bake(field, request);
+  scope.postMessage({ id, vertices, count, paths, seeds }, [vertices.buffer, seeds.buffer]);
 };

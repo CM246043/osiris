@@ -62,6 +62,12 @@ export class WindParticles {
   private hy = new Float32Array(0);
   private len = new Uint8Array(0);
   private head = 0;
+  /** Scratch for draw(), kept between frames so drawing allocates nothing. */
+  private dim = new Uint8Array(0);
+  private order = new Uint32Array(0);
+  private bandStart = new Uint32Array(WIND_BANDS.length + 1);
+  private bandFill = new Uint32Array(WIND_BANDS.length);
+  private stepStart = new Uint16Array(LEVELS.length + 1);
   /** Set when the map moved: the tails' screen positions are stale. */
   private moved = true;
   private width = 0;
@@ -123,6 +129,8 @@ export class WindParticles {
     this.hx = new Float32Array(count * TAIL);
     this.hy = new Float32Array(count * TAIL);
     this.len = new Uint8Array(count);
+    this.dim = new Uint8Array(count);
+    this.order = new Uint32Array(count);
     // Start at random ages, so they don't all die and respawn together.
     for (let k = 0; k < count; k++) this.spawn(k, true);
     this.moved = true;
@@ -217,52 +225,70 @@ export class WindParticles {
     this.draw();
   };
 
-  /** Every tail, batched into one path per colour band and opacity step. */
+  /**
+   * Every tail, batched into one stroke per colour band and opacity step.
+   *
+   * Drawn on the context's own path, reset by beginPath, never on a fresh
+   * Path2D per frame: a Path2D keeps its geometry outside the JS heap, so the
+   * collector never felt the hundreds of thousands of segments a second piling
+   * up, and with particles on for a few minutes the tab ran out of memory.
+   */
   private draw(): void {
     const tail = Math.max(2, Math.min(TAIL, Math.round(this.style.trail * FRAME_MS / this.frameMs)));
     const levels = LEVELS.length;
-    const paths = WIND_BANDS.map(() => LEVELS.map(() => new Path2D()));
-    const used = WIND_BANDS.map(() => LEVELS.map(() => false));
+    const bands = WIND_BANDS.length;
+    // Where along a tail each opacity step starts: segment i (1-based) is at
+    // step floor((i - 1) * levels / (tail - 1)).
+    const from = this.stepStart;
+    for (let l = 0; l <= levels; l++) from[l] = Math.ceil(l * (tail - 1) / levels) + 1;
+
+    // Particles grouped by band, each with how far its tail is dimmed.
+    const order = this.order;
+    const starts = this.bandStart;
+    starts.fill(0);
+    for (let k = 0; k < this.count; k++) if (this.len[k] >= 2) starts[this.band[k] + 1]++;
+    for (let b = 0; b < bands; b++) starts[b + 1] += starts[b];
+    const fill = this.bandFill;
+    for (let b = 0; b < bands; b++) fill[b] = starts[b];
     for (let k = 0; k < this.count; k++) {
-      const n = Math.min(this.len[k], tail);
-      if (n < 2) continue;
+      if (this.len[k] < 2) continue;
       // Fade in when set down, and out before it goes.
       const edge = Math.min(this.age[k], this.life[k] - this.age[k]);
-      const dim = edge < 120 ? 2 : edge < 300 ? 1 : 0;
-      const band = this.band[k];
-      const base = k * TAIL;
-      let slot = this.head;
-      let x = this.hx[base + slot];
-      let y = this.hy[base + slot];
-      let level = -1;
-      let path: Path2D | null = null;
-      for (let i = 1; i < n; i++) {
-        const l = Math.floor((i - 1) * levels / (tail - 1)) + dim;
-        if (l >= levels) break;
-        slot = (slot + TAIL - 1) % TAIL;
-        const x2 = this.hx[base + slot];
-        const y2 = this.hy[base + slot];
-        if (l !== level) {
-          path = paths[band][l];
-          used[band][l] = true;
-          path.moveTo(x, y);
-          level = l;
-        }
-        path!.lineTo(x2, y2);
-        x = x2;
-        y = y2;
-      }
+      this.dim[k] = edge < 120 ? 2 : edge < 300 ? 1 : 0;
+      order[fill[this.band[k]]++] = k;
     }
+
     const ctx = this.ctx;
     ctx.lineWidth = 1;
     ctx.lineCap = 'butt';
     ctx.lineJoin = 'bevel';
-    WIND_BANDS.forEach((_, b) => {
+    for (let b = 0; b < bands; b++) {
+      if (starts[b] === starts[b + 1]) continue;
       for (let l = 0; l < levels; l++) {
-        if (!used[b][l]) continue;
+        let drawn = false;
+        ctx.beginPath();
+        for (let o = starts[b]; o < starts[b + 1]; o++) {
+          const k = order[o];
+          const step = l - this.dim[k];
+          if (step < 0) continue;
+          const n = Math.min(this.len[k], tail);
+          // Segments i in [first, last) belong to this opacity step.
+          const first = from[step];
+          const last = Math.min(n, from[step + 1]);
+          if (first >= last) continue;
+          const base = k * TAIL;
+          let slot = (this.head + TAIL - (first - 1)) % TAIL;
+          ctx.moveTo(this.hx[base + slot], this.hy[base + slot]);
+          for (let i = first; i < last; i++) {
+            slot = (slot + TAIL - 1) % TAIL;
+            ctx.lineTo(this.hx[base + slot], this.hy[base + slot]);
+          }
+          drawn = true;
+        }
+        if (!drawn) continue;
         ctx.strokeStyle = this.colors[b][l];
-        ctx.stroke(paths[b][l]);
+        ctx.stroke();
       }
-    });
+    }
   }
 }

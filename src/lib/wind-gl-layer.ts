@@ -2,12 +2,19 @@ import type { CustomLayerInterface, CustomRenderMethodInput, Map as MlMap } from
 import { createSatelliteProgramCache } from './satellite-programs';
 import { WIND_STYLE, type WindGrid, type WindStyle } from './wind-layer';
 import {
-  bakeWindStreamlines,
+  boundsContain,
   cameraHeight,
+  createWindBaker,
+  padBounds,
   windHeightFade,
+  windLevel,
+  windSeedCount,
+  windSpacing,
   WIND_NARROW_PATH_LIMIT,
   WIND_PATH_LIMIT,
   WIND_STRIDE,
+  type WindBakeRequest,
+  type WindBounds,
   type WindStreamlines,
 } from './wind-streamlines';
 
@@ -24,6 +31,9 @@ import {
  * on the flat map and on the globe; on the globe a curve fades out as it turns
  * to the horizon and is gone on the far side, and the whole layer fades as the
  * camera comes down to the ground (see windHeightFade).
+ *
+ * Zoomed in, a finer set made for the view is drawn instead of the globe's,
+ * never alongside it: one set of curves is on the screen at a time.
  */
 
 const LAYER_ID = 'wind-streamlines';
@@ -40,6 +50,15 @@ const FRAME_MS = 33;
 const BAKE_GAP_MS = 120;
 const MAX_DENSITY = 2;
 const MIN_DENSITY = 0.25;
+/** A view's set reaches this share of the view again past every side, so a short pan stays inside it. */
+const DETAIL_PAD = 0.25;
+/** The set is made again once the view comes this near its edge. */
+const DETAIL_MARGIN = 0.08;
+/**
+ * Most seeds a view's set may try, a little over what the globe's own tries: a
+ * tilted view out to the horizon takes a coarser level rather than more time.
+ */
+const MAX_DETAIL_SEEDS = 40000;
 
 const VERT = `
 layout(location = 0) in vec2 a_corner;  // along 0|1 and across -1..1: one corner of a segment's quad
@@ -56,7 +75,8 @@ out float v_facing;
 float windFacing(vec2 merc) {
 #ifdef GLOBE
   vec4 plane = u_projection_clipping_plane;
-  if (plane.w > -1e-6 || u_projection_transition < 0.999) return 1.0;
+  // Kept while the globe flattens into the map (zoom 11 to 12): the far side still shows through it then.
+  if (plane.w > -1e-6) return 1.0;
   // The horizon plane is (unit normal toward the camera, -1 / camera distance): the camera, in Earth radii.
   vec3 cam = plane.xyz * (-1.0 / plane.w);
   vec3 p = projectToSphere(merc, merc);
@@ -131,22 +151,55 @@ function compile(gl: WebGL2RenderingContext, type: number, src: string): WebGLSh
   return sh;
 }
 
+/** What a view's set was made for: the detail level of the view, and the box it covers. */
+export interface WindCover {
+  level: number;
+  bounds: WindBounds;
+}
+
 export interface WindGlLayer extends CustomLayerInterface {
-  /** The curves to draw; null draws nothing. */
+  /** The globe's curves; null drops them. */
   setStreamlines(lines: WindStreamlines | null): void;
+  /** Finer curves for part of the globe, drawn instead of the globe's while the view is zoomed in on them; null drops them. */
+  setDetail(lines: WindStreamlines | null, cover?: WindCover): void;
   /** How the comets move: their speed and tail length. */
   setLook(look: { speed: number; trail: number }): void;
 }
 
+/** The part of the globe in view, as a box. */
+export function viewBounds(map: MlMap): WindBounds {
+  const box = map.getBounds();
+  const west = box.getWest();
+  let east = box.getEast();
+  if (east < west) east += 360;
+  const south = Math.max(-90, box.getSouth());
+  const north = Math.min(90, box.getNorth());
+  return east - west >= 360 ? [-180, south, 180, north] : [west, south, east, north];
+}
+
+/** Is a view's set right for the map as it is now: zoomed in about as far, and over all of the view? */
+function covers(cover: WindCover, map: MlMap): boolean {
+  const level = windLevel(map.getZoom());
+  return level > 0 && Math.abs(level - cover.level) <= 1 && boundsContain(cover.bounds, viewBounds(map));
+}
+
+/** One set of curves on the GPU. */
+interface Curves {
+  vao: WebGLVertexArrayObject | null;
+  buffer: WebGLBuffer | null;
+  lines: WindStreamlines | null;
+  instances: number;
+  dirty: boolean;
+}
+const noCurves = (): Curves => ({ vao: null, buffer: null, lines: null, instances: 0, dirty: false });
+
 export function createWindGlLayer(): WindGlLayer {
   let gl: WebGL2RenderingContext | null = null;
   let map: MlMap | null = null;
-  let vao: WebGLVertexArrayObject | null = null;
   let corners: WebGLBuffer | null = null;
-  let buffer: WebGLBuffer | null = null;
-  let lines: WindStreamlines | null = null;
-  let instances = 0;
-  let dirty = false;
+  const globe = noCurves();
+  const detail = noCurves();
+  let cover: WindCover | null = null;
   let speed = WIND_STYLE.speed;
   let trail = WIND_STYLE.trail;
   let clock = 0;
@@ -173,6 +226,40 @@ export function createWindGlLayer(): WindGlLayer {
   // One program per projection variant: the prelude changes between flat and globe.
   const programs = createSatelliteProgramCache<WebGLProgram>((_kind, prelude, define) => link(prelude, define), pr => gl?.deleteProgram(pr));
 
+  const attach = (curves: Curves) => {
+    curves.buffer = gl!.createBuffer();
+    curves.vao = gl!.createVertexArray();
+    gl!.bindVertexArray(curves.vao);
+    gl!.bindBuffer(gl!.ARRAY_BUFFER, corners);
+    gl!.enableVertexAttribArray(0);
+    gl!.vertexAttribPointer(0, 2, gl!.FLOAT, false, 0, 0);
+    gl!.vertexAttribDivisor(0, 0);
+    // A segment is one vertex and the next, so the same buffer is bound twice, a vertex apart.
+    gl!.bindBuffer(gl!.ARRAY_BUFFER, curves.buffer);
+    const stride = WIND_STRIDE * 4;
+    gl!.enableVertexAttribArray(1);
+    gl!.vertexAttribPointer(1, 4, gl!.FLOAT, false, stride, 0);
+    gl!.vertexAttribDivisor(1, 1);
+    gl!.enableVertexAttribArray(2);
+    gl!.vertexAttribPointer(2, 4, gl!.FLOAT, false, stride, stride);
+    gl!.vertexAttribDivisor(2, 1);
+    gl!.bindVertexArray(null);
+    curves.dirty = true;
+  };
+  const detach = (curves: Curves) => {
+    if (gl) {
+      if (curves.vao) gl.deleteVertexArray(curves.vao);
+      if (curves.buffer) gl.deleteBuffer(curves.buffer);
+    }
+    curves.vao = curves.buffer = null;
+  };
+  const load = (curves: Curves, next: WindStreamlines | null) => {
+    curves.lines = next;
+    curves.instances = next ? Math.max(0, next.count - 1) : 0;
+    curves.dirty = true;
+    map?.triggerRepaint();
+  };
+
   return {
     id: LAYER_ID,
     type: 'custom',
@@ -182,25 +269,10 @@ export function createWindGlLayer(): WindGlLayer {
       map = m;
       gl = context;
       corners = gl.createBuffer();
-      buffer = gl.createBuffer();
-      vao = gl.createVertexArray();
-      gl.bindVertexArray(vao);
       gl.bindBuffer(gl.ARRAY_BUFFER, corners);
       gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, -1, 1, -1, 0, 1, 0, 1, 1, -1, 1, 1]), gl.STATIC_DRAW);
-      gl.enableVertexAttribArray(0);
-      gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-      gl.vertexAttribDivisor(0, 0);
-      // A segment is one vertex and the next, so the same buffer is bound twice, a vertex apart.
-      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-      const stride = WIND_STRIDE * 4;
-      gl.enableVertexAttribArray(1);
-      gl.vertexAttribPointer(1, 4, gl.FLOAT, false, stride, 0);
-      gl.vertexAttribDivisor(1, 1);
-      gl.enableVertexAttribArray(2);
-      gl.vertexAttribPointer(2, 4, gl.FLOAT, false, stride, stride);
-      gl.vertexAttribDivisor(2, 1);
-      gl.bindVertexArray(null);
-      dirty = true;
+      attach(globe);
+      attach(detail);
     },
 
     onRemove() {
@@ -208,20 +280,22 @@ export function createWindGlLayer(): WindGlLayer {
       timer = null;
       if (gl) {
         programs.clear();
-        if (vao) gl.deleteVertexArray(vao);
-        if (buffer) gl.deleteBuffer(buffer);
+        detach(globe);
+        detach(detail);
         if (corners) gl.deleteBuffer(corners);
       }
-      vao = buffer = corners = null;
+      corners = null;
       gl = null;
       map = null;
     },
 
     setStreamlines(next) {
-      lines = next;
-      instances = next ? Math.max(0, next.count - 1) : 0;
-      dirty = true;
-      map?.triggerRepaint();
+      load(globe, next);
+    },
+
+    setDetail(next, at) {
+      cover = next && at ? at : null;
+      load(detail, cover ? next : null);
     },
 
     setLook(look) {
@@ -231,16 +305,20 @@ export function createWindGlLayer(): WindGlLayer {
     },
 
     render(_context: WebGL2RenderingContext | WebGLRenderingContext, args: CustomRenderMethodInput) {
-      if (!gl || !map || !vao || !buffer) return;
+      if (!gl || !map) return;
       const shader = args?.shaderData;
       const proj = args?.defaultProjectionData;
       if (!shader?.vertexShaderPrelude || !proj) return;
-      if (dirty) {
-        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      // The view's own set when it fits the view, else the globe's; never both.
+      const curves = detail.instances > 0 && cover && covers(cover, map) ? detail : globe;
+      if (!curves.vao || !curves.buffer) return;
+      if (curves.dirty) {
+        const { lines } = curves;
+        gl.bindBuffer(gl.ARRAY_BUFFER, curves.buffer);
         gl.bufferData(gl.ARRAY_BUFFER, lines ? lines.vertices.subarray(0, lines.count * WIND_STRIDE) : new Float32Array(0), gl.DYNAMIC_DRAW);
-        dirty = false;
+        curves.dirty = false;
       }
-      if (instances <= 0) return;
+      if (curves.instances <= 0) return;
       const fade = windHeightFade(cameraHeight(map.getZoom(), map.getCenter().lat, map.getCanvas().clientHeight));
       if (fade <= 0) return;
       let program: WebGLProgram;
@@ -273,8 +351,8 @@ export function createWindGlLayer(): WindGlLayer {
       gl.depthMask(false);
       gl.enable(gl.BLEND);
       gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-      gl.bindVertexArray(vao);
-      gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, instances);
+      gl.bindVertexArray(curves.vao);
+      gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, curves.instances);
       gl.bindVertexArray(null);
 
       // The comets move, so another frame is due; the map does not otherwise know.
@@ -285,29 +363,39 @@ export function createWindGlLayer(): WindGlLayer {
   };
 }
 
+/** A set asked of the baker, and the wind and view it was asked for. */
+type Job = WindBakeRequest & { version: number; cover?: WindCover };
+
 /**
  * The Wind layer's drawing: curves from the wind field, on a custom layer that
  * puts itself back after a style change. Make one for a map, give it fields as
  * the slider moves, and remove it when the layer goes off. The curves are made
  * in a worker; one set is made at a time, and only for the newest wind.
+ *
+ * Zoomed in, the set for the view comes first and is made again when the map
+ * zooms a step or pans near its edge; the globe's set is then only remade when
+ * the map comes back out to it.
  */
 export class WindOverlay {
   private map: MlMap;
   private layer = createWindGlLayer();
   private field: WindGrid | null = null;
+  /** Bumped with every new wind, so a set made from older wind is known to be out of date. */
+  private version = 0;
   private style: WindStyle = { ...WIND_STYLE };
   private timer: ReturnType<typeof setTimeout> | null = null;
   private lastBake = 0;
   private narrow: boolean;
-  private baked = false;
   private worker: Worker | null = null;
   /** No worker to be had: curves are made here instead. */
   private inline = false;
-  /** A set is being made, and which request it answers. */
-  private busy = false;
+  private bakeHere = createWindBaker();
+  /** The set being made, if one is, and which request it answers. */
+  private pending: Job | null = null;
   private request = 0;
-  /** The wind changed while a set was being made. */
-  private stale = false;
+  /** What the sets on the layer were made from. */
+  private globe: Job | null = null;
+  private detail: Job | null = null;
 
   constructor(map: MlMap) {
     this.map = map;
@@ -315,14 +403,17 @@ export class WindOverlay {
     this.ensure();
     map.on('style.load', this.ensure);
     map.on('resize', this.onResize);
+    map.on('moveend', this.onMoveEnd);
   }
 
   /** The wind to draw, in m/s; null draws nothing. */
   setField(field: WindGrid | null): void {
     this.field = field;
+    this.version++;
     if (!field) {
       this.layer.setStreamlines(null);
-      this.baked = false;
+      this.layer.setDetail(null);
+      this.globe = this.detail = null;
       this.request++; // whatever is being made is for wind that is gone
       return;
     }
@@ -343,6 +434,7 @@ export class WindOverlay {
     this.worker = null;
     this.map.off('style.load', this.ensure);
     this.map.off('resize', this.onResize);
+    this.map.off('moveend', this.onMoveEnd);
     if (this.map.getStyle() && this.map.getLayer(LAYER_ID)) this.map.removeLayer(LAYER_ID);
   }
 
@@ -362,10 +454,45 @@ export class WindOverlay {
     if (this.field) this.schedule();
   };
 
-  /** Rebuild the curves soon, but not more often than the wind can usefully change under them. */
+  private onMoveEnd = () => {
+    if (this.field) this.schedule();
+  };
+
+  /** How far apart the curves are, as a count over the globe: fewer on a phone, and as the tuning has it. */
+  private count(): number {
+    const density = Math.min(MAX_DENSITY, Math.max(MIN_DENSITY, this.style.density));
+    return Math.round((this.narrow ? WIND_NARROW_PATH_LIMIT : WIND_PATH_LIMIT) * density);
+  }
+
+  /**
+   * The set to make next, if any: zoomed in, the view's own; then the globe's,
+   * which stands in while a view's set is being made.
+   */
+  private next(): Job | null {
+    const count = this.count();
+    const version = this.version;
+    const level = windLevel(this.map.getZoom());
+    const globe = this.globe;
+    const globeJob: Job = { kind: 'globe', count, level: 0, version };
+    if (level > 0) {
+      const view = viewBounds(this.map);
+      const detail = this.detail;
+      const fits = detail?.cover && detail.version === version && detail.count === count
+        && detail.cover.level === level && boundsContain(detail.cover.bounds, padBounds(view, DETAIL_MARGIN));
+      // The globe's set is out of sight; it is kept only to stand in.
+      if (fits) return globe && globe.count === count ? null : globeJob;
+      const bounds = padBounds(view, DETAIL_PAD);
+      let bake = level;
+      while (bake > 0 && windSeedCount(bounds, windSpacing(count, bake)) > MAX_DETAIL_SEEDS) bake--;
+      if (bake > 0) return { kind: 'detail', count, level: bake, bounds, version, cover: { level, bounds } };
+    }
+    return globe && globe.version === version && globe.count === count ? null : globeJob;
+  }
+
+  /** Make the next set soon, but not more often than the wind can usefully change under it. */
   private schedule(): void {
-    if (this.timer) return;
-    const wait = this.baked ? Math.max(0, BAKE_GAP_MS - (performance.now() - this.lastBake)) : 0;
+    if (this.timer || this.pending) return; // a set being made schedules the next when it is done
+    const wait = this.lastBake ? Math.max(0, BAKE_GAP_MS - (performance.now() - this.lastBake)) : 0;
     this.timer = setTimeout(() => {
       this.timer = null;
       this.bake();
@@ -373,24 +500,30 @@ export class WindOverlay {
   }
 
   private bake(): void {
-    if (!this.field) return;
-    if (this.busy) { this.stale = true; return; }
-    const density = Math.min(MAX_DENSITY, Math.max(MIN_DENSITY, this.style.density));
-    const count = Math.round((this.narrow ? WIND_NARROW_PATH_LIMIT : WIND_PATH_LIMIT) * density);
+    if (!this.field || this.pending) return;
+    const job = this.next();
+    if (!job) return;
+    const { kind, count, level, bounds } = job;
     const worker = this.getWorker();
     if (!worker) {
-      this.done(bakeWindStreamlines(this.field, { count }));
+      this.done(job, this.bakeHere(this.field, { kind, count, level, bounds }));
+      this.schedule();
       return;
     }
-    this.busy = true;
+    this.pending = job;
     // Copied, not transferred: the slider blends the next wind into these same arrays.
-    worker.postMessage({ id: ++this.request, field: this.field, count });
+    worker.postMessage({ id: ++this.request, field: this.field, kind, count, level, bounds });
   }
 
-  private done(lines: WindStreamlines): void {
-    this.layer.setStreamlines(lines);
+  private done(job: Job, lines: WindStreamlines): void {
+    if (job.kind === 'globe') {
+      this.layer.setStreamlines(lines);
+      this.globe = job;
+    } else {
+      this.layer.setDetail(lines, job.cover);
+      this.detail = job;
+    }
     this.lastBake = performance.now();
-    this.baked = true;
   }
 
   private getWorker(): Worker | null {
@@ -398,16 +531,17 @@ export class WindOverlay {
     try {
       const worker = new Worker(new URL('./wind-streamlines.worker.ts', import.meta.url), { type: 'module' });
       worker.onmessage = ({ data }: MessageEvent<WindStreamlines & { id: number }>) => {
-        this.busy = false;
-        if (data.id === this.request && this.field) this.done(data);
-        if (this.stale) { this.stale = false; this.schedule(); }
+        const job = this.pending;
+        this.pending = null;
+        if (job && data.id === this.request && this.field) this.done(job, data);
+        this.schedule();
       };
       worker.onerror = () => {
         // The worker would not run: make the curves here from now on.
         worker.terminate();
         this.worker = null;
         this.inline = true;
-        this.busy = false;
+        this.pending = null;
         this.schedule();
       };
       this.worker = worker;
