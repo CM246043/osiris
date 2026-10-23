@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect, useCallback, useId } from 'react';
 import { Loader2, Navigation, Route, Search, SearchX, X } from 'lucide-react';
+import { searchPlaces, type GeoResult } from '@/lib/geosearch';
 import { forgetRecent, loadRecent, rememberPlace, type RecentPlace } from '@/lib/recent-places';
 import { Key, PlaceRow, type PlaceLike } from './places';
 
@@ -116,25 +117,23 @@ export default function SearchBar({ onLocate, center = null, onClose, onDirectio
     }
     if (q.trim().length < 2) { abortRef.current?.abort(); setResults([]); setLoading(false); setAnswered(q); return; }
 
-    /* Through our own route, never straight to Nominatim: one cache and one
-       budget for every visitor instead of one search per person per keystroke
-       (see lib/nominatim.ts). It sends where the map is looking, so
-       "Notre-Dame" over Montreal is the basilica rather than a village in
-       Normandy, and abandons the lookup for an earlier keystroke, so a slow
-       reply for "Par" can never land after the one for "Paris". */
+    /* Photon from the browser, Nominatim only through our own route (see
+       lib/geosearch.ts). It sends where the map is looking, so "Notre-Dame"
+       over Montreal is the basilica rather than a village in Normandy, and
+       abandons the lookup for an earlier keystroke, so a slow reply for "Par"
+       can never land after the one for "Paris". */
     setLoading(true);
     timerRef.current = setTimeout(async () => {
       abortRef.current?.abort();
       const ctrl = new AbortController();
       abortRef.current = ctrl;
+      const show = (found: GeoResult[]) => setResults(found.map(r => ({
+        label: r.name, context: r.context, lat: r.lat, lng: r.lng, kind: r.kind || 'place', zoom: ZOOM_BY_KIND[r.kind] ?? 13,
+      })));
       try {
-        const bias = center ? `&lat=${center.lat}&lng=${center.lng}` : '';
-        const res = await fetch(`/api/geosearch?q=${encodeURIComponent(q)}${bias}`, { signal: ctrl.signal });
-        const data = await res.json();
+        const found = await searchPlaces(q, center, ctrl.signal, show);
         if (ctrl.signal.aborted) return;
-        setResults((data.results || []).map((r: { name: string; context: string; lat: number; lng: number; kind: string }) => ({
-          label: r.name, context: r.context, lat: r.lat, lng: r.lng, kind: r.kind || 'place', zoom: ZOOM_BY_KIND[r.kind] ?? 13,
-        })));
+        show(found);
       } catch {
         // An abandoned lookup is not a failure; the newer one owns the list.
         if (ctrl.signal.aborted) return;

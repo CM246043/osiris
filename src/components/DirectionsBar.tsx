@@ -7,6 +7,7 @@ import {
   LocateFixed, Crosshair, Clock, Plus, Trash2, SlidersHorizontal, Mountain, Navigation, Play,
   AlertTriangle, Loader2, type LucideIcon,
 } from 'lucide-react';
+import { searchPlaces, type GeoResult } from '@/lib/geosearch';
 import { loadRecent, rememberPlace, type RecentPlace } from '@/lib/recent-places';
 import { PlaceRow } from './places';
 
@@ -56,14 +57,6 @@ export interface LiveLocation {
   lng: number;
   accuracy?: number;
   heading?: number | null;
-}
-
-interface GeoHit {
-  name: string;
-  context: string;
-  lat: number;
-  lng: number;
-  kind: string;
 }
 
 interface Place {
@@ -351,19 +344,17 @@ function PlaceInput({
       abort.current = ctrl;
 
       setLoading(true);
-      try {
-        const bias = biasLat !== undefined && biasLng !== undefined
-          ? `&lat=${biasLat}&lng=${biasLng}` : '';
-        const res = await fetch(
-          `/api/geosearch?q=${encodeURIComponent(q)}${bias}`,
-          { signal: ctrl.signal },
-        );
-        const data: { results?: GeoHit[] } = await res.json();
-        if (ctrl.signal.aborted) return;
-        setResults((data.results || []).map((r) => ({
+      const show = (found: GeoResult[]) => {
+        setResults(found.map((r) => ({
           label: r.name, context: r.context, lat: r.lat, lng: r.lng, kind: r.kind,
         })));
         setOpen(true);
+      };
+      try {
+        const near = biasLat !== undefined && biasLng !== undefined ? { lat: biasLat, lng: biasLng } : null;
+        const found = await searchPlaces(q, near, ctrl.signal, show);
+        if (ctrl.signal.aborted) return;
+        show(found);
       } catch {
         if (!ctrl.signal.aborted) setResults([]);
       }
